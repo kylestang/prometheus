@@ -107,15 +107,28 @@ func NewGroup(o GroupOptions) *Group {
 		metrics = NewGroupMetrics(opts.Registerer)
 	}
 
+	alertingCount := 0
+	recordingCount := 0
+	for _, rule := range o.Rules {
+		switch rule.(type) {
+		case *AlertingRule:
+			alertingCount++
+		case *RecordingRule:
+			recordingCount++
+		}
+	}
+
 	key := GroupKey(o.File, o.Name)
 	metrics.IterationsMissed.WithLabelValues(key)
 	metrics.IterationsScheduled.WithLabelValues(key)
 	metrics.EvalTotal.WithLabelValues(key)
-	metrics.EvalFailures.WithLabelValues(key)
+	metrics.EvalFailures.WithLabelValues(key, KindAlerting)
+	metrics.EvalFailures.WithLabelValues(key, KindRecording)
 	metrics.GroupLastEvalTime.WithLabelValues(key)
 	metrics.GroupLastDuration.WithLabelValues(key)
 	metrics.GroupLastRuleDurationSum.WithLabelValues(key)
-	metrics.GroupRules.WithLabelValues(key).Set(float64(len(o.Rules)))
+	metrics.GroupRules.WithLabelValues(key, KindAlerting).Set(float64(alertingCount))
+	metrics.GroupRules.WithLabelValues(key, KindRecording).Set(float64(recordingCount))
 	metrics.GroupSamples.WithLabelValues(key)
 	metrics.GroupInterval.WithLabelValues(key).Set(o.Interval.Seconds())
 
@@ -542,7 +555,13 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 			rule.SetHealth(HealthBad)
 			rule.SetLastError(err)
 			sp.SetStatus(codes.Error, err.Error())
-			g.metrics.EvalFailures.WithLabelValues(GroupKey(g.File(), g.Name())).Inc()
+
+			switch rule.(type) {
+			case *AlertingRule:
+				g.metrics.EvalFailures.WithLabelValues(GroupKey(g.File(), g.Name()), KindAlerting).Inc()
+			case *RecordingRule:
+				g.metrics.EvalFailures.WithLabelValues(GroupKey(g.File(), g.Name()), KindRecording).Inc()
+			}
 
 			// Canceled queries are intentional termination of queries. This normally
 			// happens on shutdown and thus we skip logging of any errors here.
@@ -572,7 +591,13 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 				rule.SetHealth(HealthBad)
 				rule.SetLastError(err)
 				sp.SetStatus(codes.Error, err.Error())
-				g.metrics.EvalFailures.WithLabelValues(GroupKey(g.File(), g.Name())).Inc()
+
+				switch rule.(type) {
+				case *AlertingRule:
+					g.metrics.EvalFailures.WithLabelValues(GroupKey(g.File(), g.Name()), KindAlerting).Inc()
+				case *RecordingRule:
+					g.metrics.EvalFailures.WithLabelValues(GroupKey(g.File(), g.Name()), KindRecording).Inc()
+				}
 
 				logger.Warn("Rule sample appending failed", "err", err)
 				return
@@ -974,7 +999,7 @@ func NewGroupMetrics(reg prometheus.Registerer) *Metrics {
 				Name:      "rule_evaluation_failures_total",
 				Help:      "The total number of rule evaluation failures.",
 			},
-			[]string{"rule_group"},
+			[]string{"rule_group", "rule_type"},
 		),
 		GroupInterval: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
@@ -1022,7 +1047,7 @@ func NewGroupMetrics(reg prometheus.Registerer) *Metrics {
 				Name:      "rule_group_rules",
 				Help:      "The number of rules.",
 			},
-			[]string{"rule_group"},
+			[]string{"rule_group", "rule_type"},
 		),
 		GroupSamples: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
@@ -1110,9 +1135,6 @@ func buildDependencyMap(rules []Rule) dependencyMap {
 		return dependencies
 	}
 
-	inputs := make(map[string][]Rule, len(rules))
-	outputs := make(map[string][]Rule, len(rules))
-
 	var indeterminate bool
 
 	for _, rule := range rules {
@@ -1120,26 +1142,46 @@ func buildDependencyMap(rules []Rule) dependencyMap {
 			break
 		}
 
-		name := rule.Name()
-		outputs[name] = append(outputs[name], rule)
-
-		parser.Inspect(rule.Query(), func(node parser.Node, path []parser.Node) error {
+		parser.Inspect(rule.Query(), func(node parser.Node, _ []parser.Node) error {
 			if n, ok := node.(*parser.VectorSelector); ok {
+				// Find the name matcher for the rule.
+				var nameMatcher *labels.Matcher
+				if n.Name != "" {
+					nameMatcher = labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, n.Name)
+				} else {
+					for _, m := range n.LabelMatchers {
+						if m.Name == model.MetricNameLabel {
+							nameMatcher = m
+							break
+						}
+					}
+				}
+
 				// A wildcard metric expression means we cannot reliably determine if this rule depends on any other,
 				// which means we cannot safely run any rules concurrently.
-				if n.Name == "" && len(n.LabelMatchers) > 0 {
+				if nameMatcher == nil {
 					indeterminate = true
 					return nil
 				}
 
 				// Rules which depend on "meta-metrics" like ALERTS and ALERTS_FOR_STATE will have undefined behaviour
 				// if they run concurrently.
-				if n.Name == alertMetricName || n.Name == alertForStateMetricName {
+				if nameMatcher.Matches(alertMetricName) || nameMatcher.Matches(alertForStateMetricName) {
 					indeterminate = true
 					return nil
 				}
 
-				inputs[n.Name] = append(inputs[n.Name], rule)
+				// Find rules which depend on the output of this rule.
+				for _, other := range rules {
+					if other == rule {
+						continue
+					}
+
+					otherName := other.Name()
+					if nameMatcher.Matches(otherName) {
+						dependencies[other] = append(dependencies[other], rule)
+					}
+				}
 			}
 			return nil
 		})
@@ -1147,14 +1189,6 @@ func buildDependencyMap(rules []Rule) dependencyMap {
 
 	if indeterminate {
 		return nil
-	}
-
-	for output, outRules := range outputs {
-		for _, outRule := range outRules {
-			if inRules, found := inputs[output]; found && len(inRules) > 0 {
-				dependencies[outRule] = append(dependencies[outRule], inRules...)
-			}
-		}
 	}
 
 	return dependencies
